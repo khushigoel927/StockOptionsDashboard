@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# App runtime artifacts
+.app.pid
+app.log
+
+# Tooling / editors
+.claude/
+.agents/
+.DS_Store
+.idea/
+.vscode/

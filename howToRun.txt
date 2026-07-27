@@ -1,0 +1,5 @@
+./app.sh start     # start in background → http://localhost:8555
+./app.sh stop      # stop it
+./app.sh restart   # stop + start
+./app.sh status    # is it running?
+./app.sh logs      # tail the log live
