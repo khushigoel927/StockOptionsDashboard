@@ -9,6 +9,11 @@ venv/
 .app.pid
 app.log
 
+# Paper trading book — personal state, not code
+paper_book.json
+paper_book.json.tmp
+paper_book.corrupt-*.json
+
 # Tooling / editors
 .claude/
 .agents/

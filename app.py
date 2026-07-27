@@ -1,33 +1,28 @@
 """
 Options Selling Explorer — a live dashboard for eyeballing cash-secured puts
-and covered calls.
+and covered calls, plus a paper-trading playground for practising selling them.
 
-Not a position tracker and not connected to a broker: rows are just "what would
-this contract look like right now" scratch cards that live in st.session_state.
+The Explorer tab is not a position tracker and not connected to a broker: rows
+are just "what would this contract look like right now" scratch cards that live
+in st.session_state. The Playground tab *does* keep score, but only on paper —
+see playground.py.
 
-Run with:  streamlit run app.py
+Run with:  streamlit run app.py   (or ./app.sh start)
 """
 
 from __future__ import annotations
 
-import logging
-import re
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
 
-import pandas as pd
 import streamlit as st
-import yfinance as yf
 
-# yfinance chatters to stderr/stdout about missing data; we surface our own messages.
-logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-
-SYMBOL_RE = re.compile(r"[A-Za-z0-9.\-^=]{1,15}")
-SPOT_TTL = 60  # seconds
-CHAIN_TTL = 60
-EXPIRY_TTL = 900
-
-PUTS, CALLS = "puts", "calls"
+import market
+import paper
+import playground
+from market import (CALLS, PUTS, DataError, fetch_expirations, fetch_quotable_strikes,
+                    fetch_spot, fetch_strikes, normalize_symbol, pretty_date,
+                    price_contract, valid_symbol)
 
 CSS = """
 <style>
@@ -58,161 +53,12 @@ CSS = """
 """
 
 
-# --------------------------------------------------------------------------- #
-# Data access (cached; the Refresh button clears these caches)
-# --------------------------------------------------------------------------- #
-
-
-class DataError(Exception):
-    """Anything that means 'we can't show a quote for this row'."""
-
-
-def normalize_symbol(raw: str) -> str:
-    return raw.strip().upper()
-
-
-def valid_symbol(symbol: str) -> bool:
-    return bool(symbol) and SYMBOL_RE.fullmatch(symbol) is not None
-
-
-def pretty_date(iso: str) -> str:
-    try:
-        dt = datetime.strptime(iso, "%Y-%m-%d")
-    except ValueError:
-        return iso
-    return f"{dt:%b} {dt.day}, {dt:%Y}"
-
-
-@st.cache_data(ttl=EXPIRY_TTL, show_spinner=False)
-def fetch_expirations(symbol: str) -> tuple[str, ...]:
-    try:
-        expirations = tuple(yf.Ticker(symbol).options or ())
-    except Exception as exc:  # noqa: BLE001 - yfinance raises a grab-bag of errors
-        raise DataError(f"Could not reach data provider for {symbol}: {exc}") from exc
-    if not expirations:
-        raise DataError(
-            f"No options expirations found for {symbol}. "
-            "The ticker may be invalid or it may not have listed options."
-        )
-    return expirations
-
-
-@st.cache_data(ttl=SPOT_TTL, show_spinner=False)
-def fetch_spot(symbol: str) -> float:
-    ticker = yf.Ticker(symbol)
-    price = None
-    try:
-        fast = ticker.fast_info
-        price = fast.get("last_price") or fast.get("lastPrice")
-    except Exception:  # noqa: BLE001 - fall through to the history lookup
-        price = None
-
-    if price is None:
-        try:
-            history = ticker.history(period="1d")
-        except Exception as exc:  # noqa: BLE001
-            raise DataError(f"Could not fetch a spot price for {symbol}: {exc}") from exc
-        if history is None or history.empty:
-            raise DataError(f"No recent price data returned for {symbol}.")
-        price = float(history["Close"].iloc[-1])
-
-    price = float(price)
-    if not price > 0:
-        raise DataError(f"Spot price for {symbol} came back as {price}.")
-    return price
-
-
-@st.cache_data(ttl=CHAIN_TTL, show_spinner=False)
-def fetch_chain(symbol: str, expiration: str, kind: str) -> pd.DataFrame:
-    try:
-        chain = yf.Ticker(symbol).option_chain(expiration)
-    except Exception as exc:  # noqa: BLE001 - provider errors can be very verbose
-        detail = str(exc).split("Available expirations")[0].strip().rstrip(".")
-        raise DataError(f"No options chain for {symbol} @ {expiration}: {detail}.") from exc
-
-    table = chain.puts if kind == PUTS else chain.calls
-    if table is None or table.empty:
-        raise DataError(f"The {kind[:-1]} chain for {symbol} @ {expiration} is empty.")
-    return table.copy()
-
-
-@st.cache_data(ttl=CHAIN_TTL, show_spinner=False)
-def fetch_strikes(symbol: str, expiration: str, kind: str) -> list[float]:
-    return sorted(float(s) for s in fetch_chain(symbol, expiration, kind)["strike"])
-
-
-# --------------------------------------------------------------------------- #
-# Quote math
-# --------------------------------------------------------------------------- #
-
-
-def _num(value: Any) -> float | None:
-    """yfinance leaves NaN/None all over the chain; normalize to float or None."""
-    if value is None:
-        return None
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        return None
-    return None if pd.isna(out) else out
-
-
-def liquidity(bid: float | None, open_interest: float | None, volume: float | None,
-              min_oi: int, min_volume: int) -> tuple[str, str, str]:
-    """Return (badge text, badge css class, explanatory note)."""
-    if not bid or bid <= 0:
-        return "No bid", "bad", "No live bid — this contract is not tradeable right now."
-
-    oi, vol = open_interest or 0, volume or 0
-    thin = []
-    if oi < min_oi:
-        thin.append(f"open interest {oi:,.0f} < {min_oi:,}")
-    if vol < min_volume:
-        thin.append(f"volume {vol:,.0f} < {min_volume:,}")
-    if thin:
-        return "Thin", "warn", "Low liquidity: " + " and ".join(thin) + "."
-    return "Liquid", "ok", ""
-
-
-def price_contract(symbol: str, expiration: str, strike: float, kind: str,
-                   min_oi: int, min_volume: int) -> dict:
-    """Pull spot + the nearest listed contract. Raises DataError on bad input."""
-    spot = fetch_spot(symbol)
-    chain = fetch_chain(symbol, expiration, kind)
-
-    strikes = chain["strike"].astype(float)
-    contract = chain.loc[(strikes - float(strike)).abs().idxmin()]
-
-    actual = float(contract["strike"])
-    bid = _num(contract.get("bid"))
-    ask = _num(contract.get("ask"))
-    open_interest = _num(contract.get("openInterest"))
-    volume = _num(contract.get("volume"))
-    badge, badge_class, note = liquidity(bid, open_interest, volume, min_oi, min_volume)
-
-    quote = {
-        "strike": actual,
-        "requested_strike": float(strike),
-        "spot": spot,
-        "bid": bid,
-        "ask": ask,
-        "open_interest": open_interest,
-        "volume": volume,
-        "badge": badge,
-        "badge_class": badge_class,
-        "note": note,
-        "premium": (bid or 0.0) * 100,
-        "fetched_at": datetime.now(),
-    }
-    if kind == PUTS:
-        # Assignment happens below the strike, so the cushion is spot - strike.
-        quote["cash_required"] = actual * 100
-        quote["move"] = spot - actual
-    else:
-        # Called away above the strike, so the room to run is strike - spot.
-        quote["move"] = actual - spot
-    quote["move_pct"] = quote["move"] / spot * 100
-    return quote
+@dataclass
+class Ctx:
+    """What every explorer renderer needs: the liquidity thresholds and the book."""
+    store: paper.Store
+    min_oi: int
+    min_volume: int
 
 
 # --------------------------------------------------------------------------- #
@@ -227,11 +73,11 @@ def init_state() -> None:
     st.session_state.setdefault("last_refresh", datetime.now())
 
 
-def reprice(row: dict, kind: str, min_oi: int, min_volume: int) -> None:
+def reprice(row: dict, kind: str, ctx: Ctx) -> None:
     """Refresh a row in place from its committed strike/expiration."""
     try:
         row["quote"] = price_contract(row["symbol"], row["expiration"], row["strike"],
-                                      kind, min_oi, min_volume)
+                                      kind, ctx.min_oi, ctx.min_volume)
         row["error"] = None
         # Snap the committed strike to the contract we actually found.
         row["strike"] = row["quote"]["strike"]
@@ -242,7 +88,7 @@ def reprice(row: dict, kind: str, min_oi: int, min_volume: int) -> None:
 
 
 def add_row(kind: str, symbol: str, expiration: str, strike: float,
-            min_oi: int, min_volume: int) -> tuple[bool, str]:
+            ctx: Ctx) -> tuple[bool, str]:
     rows = st.session_state[kind]
     if any(r["symbol"] == symbol and r["expiration"] == expiration
            and abs(r["strike"] - strike) < 1e-9 for r in rows):
@@ -252,7 +98,7 @@ def add_row(kind: str, symbol: str, expiration: str, strike: float,
            "expiration": expiration, "strike": float(strike),
            "quote": None, "error": None}
     st.session_state.next_id += 1
-    reprice(row, kind, min_oi, min_volume)
+    reprice(row, kind, ctx)
     rows.append(row)
     return True, f"Added {symbol} {pretty_date(expiration)} {strike:g}."
 
@@ -264,32 +110,48 @@ def add_row(kind: str, symbol: str, expiration: str, strike: float,
 
 def nearest_strike(symbol: str, expiration: str, kind: str,
                    spot: float) -> float | None:
-    """Closest listed strike to spot; None if the chain can't be read."""
+    """Closest strike to spot that has a live bid; None if the chain can't be read.
+
+    Prefers quotable strikes so the suggested strike is one you could actually
+    sell, falling back to the full list when nothing is quoted.
+    """
     try:
-        strikes = fetch_strikes(symbol, expiration, kind)
+        strikes = (fetch_quotable_strikes(symbol, expiration, kind)
+                   or fetch_strikes(symbol, expiration, kind))
     except DataError:
         return None
     return min(strikes, key=lambda s: abs(s - spot)) if strikes else None
 
 
 def spot_line(symbol: str, expiration: str, kind: str, spot: float | None) -> str:
-    """The 'here's what the stock costs right now' line under the add form."""
+    """The 'here's what the stock costs right now' line under the add form.
+
+    Reports the range of strikes with a live bid rather than every listed
+    strike: deep out-of-the-money strikes stay listed long after anyone stops
+    quoting them, so the listed range suggests contracts you can't sell.
+    """
     price = f"<b>${spot:,.2f}</b>" if spot else "<b>unavailable</b>"
     meta = ""
     try:
-        strikes = fetch_strikes(symbol, expiration, kind)
-        meta = (f" · {len(strikes)} strikes for {pretty_date(expiration)} "
-                f"(${min(strikes):,.2f} – ${max(strikes):,.2f})")
-        if spot:
-            near = min(strikes, key=lambda s: abs(s - spot))
-            meta += f" · nearest to spot <b>{near:g}</b>"
+        listed = fetch_strikes(symbol, expiration, kind)
+        quotable = fetch_quotable_strikes(symbol, expiration, kind)
+        if quotable:
+            meta = (f" · {len(quotable)} of {len(listed)} strikes have a live bid for "
+                    f"{pretty_date(expiration)} "
+                    f"(${min(quotable):,.2f} – ${max(quotable):,.2f})")
+            if spot:
+                near = min(quotable, key=lambda s: abs(s - spot))
+                meta += f" · nearest to spot <b>{near:g}</b>"
+        elif listed:
+            meta = (f" · none of the {len(listed)} strikes listed for "
+                    f"{pretty_date(expiration)} have a live bid right now")
     except DataError:
         pass
     return (f'<div class="oc-spot"><span class="oc-spot-tick">{symbol}</span> '
             f'spot {price}<span class="oc-spot-meta">{meta}</span></div>')
 
 
-def render_add_form(kind: str, min_oi: int, min_volume: int) -> None:
+def render_add_form(kind: str, ctx: Ctx) -> None:
     label = "put" if kind == PUTS else "call"
     symbol_key, strike_key = f"{kind}_symbol", f"{kind}_strike"
 
@@ -325,16 +187,21 @@ def render_add_form(kind: str, min_oi: int, min_volume: int) -> None:
             hint = f"{nearest_strike(symbol, guess, kind, spot) or spot:g}"
 
         cols = st.columns([1.4, 1, 1.6, 1], vertical_alignment="bottom")
+        # persist_state keeps what you typed when you switch to the Playground
+        # tab and back — without it Streamlit drops the value of any widget that
+        # didn't render, and the lazy tabs mean this one doesn't.
         with cols[0]:
-            st.text_input("Symbol", key=symbol_key, placeholder="Enter symbol")
+            st.text_input("Symbol", key=symbol_key, placeholder="Enter symbol",
+                          persist_state="session")
         with cols[1]:
             strike = st.number_input("Strike", key=strike_key, min_value=0.01,
-                                     step=0.50, format="%.2f", placeholder=hint)
+                                     step=0.50, format="%.2f", placeholder=hint,
+                                     persist_state="session")
         with cols[2]:
             expiration = st.selectbox(
                 "Expiration", expirations or [None], key=expiry_key,
                 format_func=lambda d: pretty_date(d) if d else "—",
-                disabled=not expirations,
+                disabled=not expirations, persist_state="session",
             )
         with cols[3]:
             submitted = st.button("＋ Add row", key=f"{kind}_add", type="primary",
@@ -353,8 +220,7 @@ def render_add_form(kind: str, min_oi: int, min_volume: int) -> None:
             st.warning("Enter a strike price first.")
             return
         with st.spinner(f"Looking up {symbol} {pretty_date(expiration)} {strike:g}…"):
-            ok, message = add_row(kind, symbol, expiration, float(strike),
-                                  min_oi, min_volume)
+            ok, message = add_row(kind, symbol, expiration, float(strike), ctx)
         if ok:
             st.session_state[f"{kind}_reset_strike"] = True
             st.rerun()
@@ -393,7 +259,7 @@ def metric_cells(row: dict, kind: str) -> list[tuple[str, str, str, bool]]:
     return cells
 
 
-def commit_edit(row: dict, kind: str, min_oi: int, min_volume: int) -> None:
+def commit_edit(row: dict, kind: str, ctx: Ctx) -> None:
     """Re-price a row the moment its strike or expiration changes.
 
     Runs as a widget on_change callback, i.e. before the rerun, so the card is
@@ -405,10 +271,10 @@ def commit_edit(row: dict, kind: str, min_oi: int, min_volume: int) -> None:
         return
     row["strike"] = float(strike)
     row["expiration"] = st.session_state[f"expiry_{rid}"]
-    reprice(row, kind, min_oi, min_volume)
+    reprice(row, kind, ctx)
 
 
-def render_card(row: dict, kind: str, min_oi: int, min_volume: int) -> None:
+def render_card(row: dict, kind: str, ctx: Ctx) -> None:
     rid = row["id"]
     label = "put" if kind == PUTS else "call"
     strike_key, expiry_key = f"strike_{rid}", f"expiry_{rid}"
@@ -452,7 +318,7 @@ def render_card(row: dict, kind: str, min_oi: int, min_volume: int) -> None:
         st.session_state.setdefault(expiry_key, row["expiration"])
 
         # Editing either control re-prices the row on the spot.
-        edit = {"on_change": commit_edit, "args": (row, kind, min_oi, min_volume)}
+        edit = {"on_change": commit_edit, "args": (row, kind, ctx)}
 
         controls = st.columns([1.1, 1.7, 3], vertical_alignment="bottom")
         with controls[0]:
@@ -485,16 +351,42 @@ def render_card(row: dict, kind: str, min_oi: int, min_volume: int) -> None:
             notes.append(f"Quoted {q['fetched_at']:%H:%M:%S}.")
             st.caption(" ".join(notes))
 
-        _, remove_col = st.columns([4, 1])
-        with remove_col:
-            remove = st.button("🗑 Remove", key=f"remove_{rid}", width="stretch")
+        # Selling copies the quote into the playground book; it never holds a
+        # reference to this row, so removing the card leaves the position alone.
+        # Selling the same contract twice is allowed on purpose — that's two
+        # real contracts, even though the explorer rejects duplicate *rows*.
+        can_sell, why = playground.sell_gate(row, kind, ctx.store)
+        sold = playground.sold_note(ctx.store.book, row["symbol"], kind,
+                                    row["expiration"], row["strike"])
+        note_col, button_col = st.columns([2, 2], vertical_alignment="center")
+        with note_col:
+            if sold:
+                st.caption(sold)
+        with button_col:
+            with st.container(horizontal=True, horizontal_alignment="right"):
+                # "Sell another" makes it obvious the first one landed, rather
+                # than leaving you wondering whether the click registered.
+                verb = "Sell another" if sold.startswith(":green") else "Sell"
+                sell = st.button(f"{verb} {label}", key=f"sell_{rid}", type="primary",
+                                 icon=":material/sell:", disabled=not can_sell, help=why)
+                remove = st.button("Remove", key=f"remove_{rid}",
+                                   icon=":material/delete:")
+
+    if sell:
+        ok, message = playground.sell_from_row(ctx.store, row, kind)
+        # Toasts render as markdown, so the dollar signs need escaping or two of
+        # them turn the text between into LaTeX.
+        st.toast(playground.md(("Paper: " + message) if ok else message),
+                 icon=":material/sell:" if ok else ":material/error:")
+        if ok:
+            st.rerun()
 
     if remove:
         st.session_state[kind] = [r for r in st.session_state[kind] if r["id"] != rid]
         st.rerun()
 
 
-def render_section(kind: str, min_oi: int, min_volume: int) -> None:
+def render_section(kind: str, ctx: Ctx) -> None:
     count = len(st.session_state[kind])
     if kind == PUTS:
         st.header(f"Puts · {count}", anchor="puts", divider="gray")
@@ -505,14 +397,49 @@ def render_section(kind: str, min_oi: int, min_volume: int) -> None:
         st.caption("Covered call: assumes you already own 100 shares per contract; "
                    "they get called away if the stock closes above the strike.")
 
-    render_add_form(kind, min_oi, min_volume)
+    render_add_form(kind, ctx)
 
     rows = st.session_state[kind]
     if not rows:
         st.info("No rows yet. Add one above.")
         return
     for row in list(rows):
-        render_card(row, kind, min_oi, min_volume)
+        render_card(row, kind, ctx)
+
+
+# --------------------------------------------------------------------------- #
+# Page
+# --------------------------------------------------------------------------- #
+
+
+def render_toolbar(ctx: Ctx) -> None:
+    header, refresh_col = st.columns([3, 1], vertical_alignment="center")
+    with header:
+        st.write(f"Last refreshed **{st.session_state.last_refresh:%H:%M:%S}** · "
+                 f"{len(st.session_state[PUTS])} put(s), "
+                 f"{len(st.session_state[CALLS])} call(s) on the Explorer · "
+                 f"{len(ctx.store.book['open'])} open paper position(s)")
+    with refresh_col:
+        refresh = st.button("Refresh all", width="stretch", icon=":material/refresh:")
+
+    # Positions only settle while the Playground is on screen, so say when some
+    # are waiting rather than leaving their reserves quietly locked.
+    due = playground.due_count(ctx.store)
+    if due:
+        st.caption(f":orange[{due} paper position(s) have expired and are ready to "
+                   f"settle — open the Playground tab.]")
+
+    if refresh:
+        # Not st.cache_data.clear(): that would also drop settled prices, which
+        # never change and are expensive to re-fetch.
+        market.clear_quote_caches()
+        st.session_state["pg_force_sweep"] = True
+        with st.spinner("Re-pulling every row…"):
+            for kind in (PUTS, CALLS):
+                for row in st.session_state[kind]:
+                    reprice(row, kind, ctx)
+        st.session_state.last_refresh = datetime.now()
+        st.rerun()
 
 
 def main() -> None:
@@ -522,8 +449,9 @@ def main() -> None:
     st.markdown(CSS, unsafe_allow_html=True)
 
     st.title("📈 Options Selling Explorer")
-    st.caption("Live quotes from Yahoo Finance via yfinance. Paper exploration "
-               "only — nothing here places a trade.")
+    st.caption("Live quotes from Yahoo Finance via yfinance. Paper trading only — the "
+               "Playground tab simulates positions you sell here, and nothing in this "
+               "app places a real trade.")
 
     with st.sidebar:
         st.header("Liquidity thresholds")
@@ -532,27 +460,24 @@ def main() -> None:
         st.caption("Rows below either threshold are badged **Thin**. A missing or "
                    "zero bid is always badged **No bid**.")
 
-    header, refresh_col = st.columns([3, 1])
-    with header:
-        st.write(f"Last refreshed **{st.session_state.last_refresh:%H:%M:%S}** · "
-                 f"{len(st.session_state[PUTS])} put(s), "
-                 f"{len(st.session_state[CALLS])} call(s)")
-    with refresh_col:
-        refresh = st.button("🔄 Refresh all", width="stretch")
+    ctx = Ctx(store=playground.get_store(), min_oi=int(min_oi), min_volume=int(min_volume))
+    render_toolbar(ctx)
 
-    if refresh:
-        st.cache_data.clear()
-        with st.spinner("Re-pulling every row…"):
-            for kind in (PUTS, CALLS):
-                for row in st.session_state[kind]:
-                    reprice(row, kind, min_oi, min_volume)
-        st.session_state.last_refresh = datetime.now()
-        st.rerun()
+    # on_change="rerun" is what makes `.open` meaningful — without it Streamlit
+    # runs *both* tab bodies every time, so the playground's price fetches would
+    # fire on every keystroke in the explorer.
+    explorer_tab, playground_tab = st.tabs(["Explorer", "Playground"],
+                                           on_change="rerun", key="main_tab")
 
-    # One scrollable page: puts on top, calls underneath.
-    render_section(PUTS, min_oi, min_volume)
-    st.write("")
-    render_section(CALLS, min_oi, min_volume)
+    if explorer_tab.open:
+        with explorer_tab:
+            render_section(PUTS, ctx)
+            st.write("")
+            render_section(CALLS, ctx)
+
+    if playground_tab.open:
+        with playground_tab:
+            playground.render_playground(ctx.store, ctx.min_oi, ctx.min_volume)
 
 
 if __name__ == "__main__":

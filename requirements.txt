@@ -1,3 +1,8 @@
-streamlit>=1.49
+# streamlit 1.60 is a hard floor: the app relies on TabContainer.open for lazy
+# tabs and on the widget persist_state parameter.
+streamlit>=1.60
 yfinance>=0.2.40
 pandas>=2.0
+# Settlement times are anchored to America/New_York; system tzdata is missing on
+# some slim Linux images.
+tzdata
