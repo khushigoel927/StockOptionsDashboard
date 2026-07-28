@@ -64,7 +64,7 @@ turns grey and reports history instead. The marker follows the *contract*, not t
 card's strike and it disappears, because the card now describes something else. Deleting a card
 never touches the position.
 
-A fresh playground starts with **$100,000**.
+A fresh playground starts with **$200,000**. You can set a different figure whenever you reset.
 
 ### How the accounting works
 

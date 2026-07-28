@@ -29,7 +29,7 @@ from typing import Any, Callable, Iterable
 import threading
 
 SCHEMA_VERSION = 1
-DEFAULT_STARTING_BALANCE = 100_000.0
+DEFAULT_STARTING_BALANCE = 200_000.0
 SHARES_PER_CONTRACT = 100
 
 PUTS, CALLS = "puts", "calls"
