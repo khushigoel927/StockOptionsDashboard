@@ -5,8 +5,7 @@ Deliberately imports nothing from streamlit or yfinance. A sign error in this
 module would quietly corrupt someone's balance, so it has to be drivable from a
 plain REPL:
 
-    from pathlib import Path
-    import paper
+    from core import paper
     book = paper.new_book()
     paper.sell_position(book, symbol="AAPL", kind="puts", expiration="2026-08-21",
                         strike=320.0, premium_per_share=4.25, spot_at_sale=336.23)
@@ -482,24 +481,35 @@ def book_path() -> Path:
     override = os.environ.get("PAPER_BOOK_PATH")
     if override:
         return Path(override).expanduser().resolve()
-    return Path(__file__).resolve().parent / "paper_book.json"
+    # Project root, not this package — the book is user data, not source.
+    return Path(__file__).resolve().parent.parent / "paper_book.json"
 
 
 class Store:
-    """One book per server process, shared by every browser tab.
+    """A book plus the lock and the file it's persisted to.
 
-    The book can't live in st.session_state: that's per-tab, so two tabs would
-    each hold a divergent copy and the last one to save would silently discard
-    the other's trades. A single process-global Store means both tabs mutate the
-    same dict and the file always reflects it.
+    `path=None` means memory only: nothing is read at startup and nothing is
+    ever written. That's what the public app uses, one Store per visitor, so
+    everyone gets their own balance and nobody's trades touch the disk.
+
+    With a path, the book is loaded once and rewritten after every mutation, and
+    the Store is meant to be process-global — shared by every browser tab and by
+    any bot running in the same process. Such a book must NOT live in
+    st.session_state: that's per-session, so two tabs would each hold a
+    divergent copy and the last one to save would silently discard the other's
+    trades.
 
     Streamlit runs each session in its own thread, so every mutation takes a
     lock across read-modify-write-persist.
     """
 
-    def __init__(self, path: Path | None = None) -> None:
-        self.path = path or book_path()
-        self.book, self.load_warning, self.read_only = load_book(self.path)
+    def __init__(self, path: Path | None = None, *,
+                 starting_balance: float = DEFAULT_STARTING_BALANCE) -> None:
+        self.path = path
+        if path is None:
+            self.book, self.load_warning, self.read_only = new_book(starting_balance), None, False
+        else:
+            self.book, self.load_warning, self.read_only = load_book(path)
         self.save_error: str | None = None
         self.last_sweep_at: float = 0.0
         self._lock = threading.Lock()
@@ -518,6 +528,8 @@ class Store:
             except Exception as exc:  # noqa: BLE001 - a bug here must not blank the page
                 return False, f"Could not complete that: {exc}"
             if not ok:
+                return ok, message
+            if self.path is None:  # memory-only book; nothing to persist
                 return ok, message
             try:
                 save_book(self.book, self.path)

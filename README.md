@@ -8,9 +8,27 @@ Two tabs:
 - **Explorer** — scratch cards answering *what would this contract look like right now?* Not a
   position tracker; rows live in `st.session_state` and disappear when the browser session ends.
 - **Playground** — sell those contracts on paper. Tracks a balance, settles positions against the
-  real closing price at expiration, and keeps a permanent history. Saved to disk.
+  real closing price at expiration, and keeps a history.
 
 Nothing in this app is connected to a broker, and nothing here places a trade.
+
+### Two apps, one codebase
+
+The same UI ships in two configurations, differing only in where the book lives:
+
+| | entrypoint | the book | who it's for |
+|---|---|---|---|
+| **Public** | `app.py` | in memory, **one per visitor**, never written to disk | deployed to Streamlit Community Cloud |
+| **Local** | `bots_app.py` | one on disk (`paper_book.json`), shared by every tab | you, on localhost, plus an extra **Bots** tab |
+
+The split exists because the playground keeps score. A single process-global book is right when one
+person runs the server and wrong the moment strangers share it — everyone would spend the same
+balance and settle each other's positions. So the public app scopes the book to
+`st.session_state`: your positions are yours, and they last as long as your browser session.
+
+`app.py` imports `core/` and nothing else, so the bot layer is absent from the deployment even
+though it lives in the same repository. The arrow is one-way: `bots/` may import `core/`, `core/`
+must never import `bots/`.
 
 ---
 
@@ -138,13 +156,19 @@ reserve, and retries — it is never settled at a guess. A position whose ticker
 
 ### Where it's saved
 
-`paper_book.json`, next to `app.py` (override with the `PAPER_BOOK_PATH` environment variable). It's
-gitignored — it's your state, not code. Writes are atomic, so a crash can't truncate it, and an
+Depends on which app you're running — see [Two apps, one codebase](#two-apps-one-codebase).
+
+**Public (`app.py`)** — nowhere. `paper.Store(path=None)` holds the book in memory and writes
+nothing, so there's no file to leak one visitor's trades to another and no state to clean up. The
+book dies with the browser session or the next app restart, which the banner says up front.
+
+**Local (`bots_app.py`)** — `paper_book.json` in the project root (override with `PAPER_BOOK_PATH`).
+Gitignored: it's your state, not code. Writes are atomic, so a crash can't truncate it, and an
 unreadable file is preserved as `paper_book.corrupt-<timestamp>.json` rather than overwritten.
 
-One book is shared by every browser tab against a running server. Running **two server processes**
-on the same directory is the one thing that will lose trades — last writer wins. `app.sh` guards
-against that with its pidfile.
+That book is shared by every browser tab against the running server. Running **two server
+processes** on it is the one thing that will lose trades — last writer wins. `app.sh` guards against
+that with a per-app pidfile.
 
 ## Requirements
 
@@ -165,55 +189,86 @@ pip install -r requirements.txt
 
 ## Running
 
-Use the control script — it runs Streamlit headless in the background on port 8555:
+Use the control script — it runs Streamlit headless in the background. The second argument picks
+the app, defaulting to `public`; each gets its own port, pidfile and log, so both can run at once:
 
 ```bash
-./app.sh start     # start in background → http://localhost:8555
-./app.sh stop      # stop it
-./app.sh restart   # stop + start
-./app.sh status    # is it running?
-./app.sh logs      # tail the log live
+./app.sh start          # public app  → http://localhost:8555
+./app.sh start bots     # local + bots → http://localhost:8556
+./app.sh stop bots      # stop it
+./app.sh restart        # stop + start
+./app.sh status bots    # is it running?
+./app.sh logs           # tail the log live
 ```
 
 Override the port with `PORT=9000 ./app.sh start`.
 
-Or run it in the foreground directly:
+Or run either in the foreground directly:
 
 ```bash
-streamlit run app.py
+streamlit run app.py        # what the world sees
+streamlit run bots_app.py   # with the Bots tab and the saved book
 ```
+
+## Deploying the public app
+
+It's built for [Streamlit Community Cloud](https://share.streamlit.io) as-is — no secrets, no
+database, no writable disk needed.
+
+1. Push to GitHub.
+2. On share.streamlit.io: **New app** → this repo → branch `main` → **main file `app.py`**.
+3. Deploy.
+
+The main-file setting is the whole of the split: point it at `app.py` and `bots/` is never
+imported. Never point it at `bots_app.py` — that app shares one balance among everyone who opens
+it.
+
+Two things to know about that host: containers sleep when idle and restart on a redeploy, and each
+restart clears every visitor's in-memory book. `st.cache_data` on the quote fetchers is shared
+across visitors, which is what keeps a busy day from turning into one Yahoo request per person.
 
 ## Project layout
 
 ```
-app.py            explorer UI, tab wiring, and the Sell buttons
-market.py         every yfinance call — quotes, chains, settlement prices
-paper.py          the paper-trading book: schema, persistence, accounting
-playground.py     playground UI, the settlement sweep, and the shared Store
+app.py            PUBLIC entrypoint — session-scoped book, no bots. This is what deploys.
+bots_app.py       local entrypoint — disk-backed book, plus the Bots tab
+core/             everything both apps share
+  market.py       every yfinance call — quotes, chains, settlement prices
+  paper.py        the paper-trading book: schema, persistence, accounting
+  playground.py   playground UI and the settlement sweep
+  explorer.py     explorer UI, the cards, and the Sell buttons
+  shell.py        the page both apps draw: title, sidebar, toolbar, tabs
+  stores.py       where the book lives — the one thing the two apps disagree on
+bots/             local-only bot layer (empty; see its docstring for the seam)
 app.sh            start/stop/restart/status/logs wrapper around Streamlit
 requirements.txt  streamlit, yfinance, pandas, tzdata
 howToRun.txt      the app.sh cheat sheet
 ```
 
-- **`market.py`** — `fetch_expirations`, `fetch_spot`, `fetch_chain`, `fetch_strikes`,
+- **`core/stores.py`** — the load-bearing file. `session_store()` is deliberately *not*
+  `@st.cache_resource` (process-global would hand every visitor the same balance);
+  `shared_store()` deliberately *is*, because bots and browser tabs in the local app have to mutate
+  one book or their writes clobber each other. Each function's docstring says why the other one
+  would be a bug there.
+- **`core/market.py`** — `fetch_expirations`, `fetch_spot`, `fetch_chain`, `fetch_strikes`,
   `fetch_quotable_strikes` and `fetch_ask`, all wrapped in `st.cache_data` with TTLs tuned to how
   fast each thing actually moves (15s for spot, 60s for chains, 15m for expiration lists);
   `fetch_settlement_close` is cached forever because a past date's close never changes. Every
   provider failure is normalized into a `DataError` so a broken row shows a message, not a
   traceback. `price_contract` finds the nearest listed strike and computes premium, cash required,
   and the move needed for the buyer to exercise.
-- **`paper.py`** — imports neither Streamlit nor yfinance, so the accounting can be exercised from a
+- **`core/paper.py`** — imports neither Streamlit nor yfinance, so the accounting can be exercised from a
   plain REPL. Holds the JSON schema, atomic saves, and every mutation (`sell_position`,
   `settle_position`, `buy_to_close`, `abandon_position`, `reset_book`), each returning
   `(ok, message)`.
-- **`playground.py`** — owns the `Store` (one book per server process, not per browser tab, so two
-  tabs can't clobber each other), the settlement sweep, the auto-refreshing `st.fragment`, and the
+- **`core/playground.py`** — the settlement sweep, the auto-refreshing `st.fragment`, and the
   playground's rendering.
-- **`app.py`** — the explorer cards and the `st.tabs` wiring. The tabs are lazy (`on_change="rerun"`
-  plus `.open`), so the playground makes no network calls while you're typing in the explorer.
+- **`core/explorer.py`** — the explorer cards. **`core/shell.py`** — the `st.tabs` wiring, which is
+  lazy (`on_change="rerun"` plus `.open`), so the playground makes no network calls while you're
+  typing in the explorer, and extra tabs are passed in by the entrypoint rather than known here.
 
 One non-obvious detail: money rendered through Streamlit markdown is escaped as `\$` via the `md()`
-and `usd()` helpers in `playground.py`. Streamlit reads a pair of unescaped `$` in one string as
+and `usd()` helpers in `core/playground.py`. Streamlit reads a pair of unescaped `$` in one string as
 inline LaTeX, which silently turns a caption full of dollar amounts into an equation. The explorer's
 cards are exempt because their numbers sit inside `<div>` blocks, which CommonMark passes through
 without parsing inline markdown.

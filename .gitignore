@@ -7,9 +7,15 @@ venv/
 
 # App runtime artifacts
 .app.pid
+.app-*.pid
 app.log
+app-*.log
 
-# Paper trading book — personal state, not code
+# Streamlit Cloud secrets — never commit
+.streamlit/secrets.toml
+
+# Paper trading book — local state only. The deployed app never writes one:
+# every visitor's book lives in their session (see core/stores.py).
 paper_book.json
 paper_book.json.tmp
 paper_book.corrupt-*.json

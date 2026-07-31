@@ -1,10 +1,13 @@
 """
 The paper-trading playground tab.
 
-Owns the Store (one book per server process), the settlement sweep, and all of
-the playground's rendering. app.py calls `render_playground` for the tab body
-and `sell_gate`/`sell_from_row` for the Sell buttons on explorer cards, so every
+Owns the settlement sweep and all of the playground's rendering. `explorer.py`
+calls `sell_gate`/`sell_from_row` for the Sell buttons on its cards, so every
 policy decision about paper trading lives here.
+
+The Store itself is passed in rather than fetched: the public app hands over a
+per-visitor in-memory book and the local app a shared one on disk. See
+`core.stores`.
 """
 
 from __future__ import annotations
@@ -15,9 +18,8 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-import market
-import paper
-from market import CALLS, PUTS, DataError, pretty_date
+from . import market, paper
+from .market import CALLS, PUTS, DataError, pretty_date
 
 # Don't re-sweep on every rerun; expired positions don't get more expired.
 SWEEP_COOLDOWN = 60.0
@@ -53,17 +55,6 @@ def md(text: str) -> str:
 def usd(value: float) -> str:
     """Money formatted for a markdown context — see `md`."""
     return f"\\${value:,.2f}"
-
-
-@st.cache_resource(show_spinner=False)
-def get_store() -> paper.Store:
-    """One Store per server process, shared by every browser tab and session.
-
-    Cached as a *resource*, not session state: session state is per-tab, so two
-    open tabs would each hold their own copy of the book and the last save would
-    silently discard the other's trades.
-    """
-    return paper.Store()
 
 
 # --------------------------------------------------------------------------- #

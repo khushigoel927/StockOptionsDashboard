@@ -1,0 +1,11 @@
+# Applies to both apps, locally and on Streamlit Community Cloud.
+
+[server]
+# Nothing here accepts an upload, so don't hold the door open for one.
+maxUploadSize = 1
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"

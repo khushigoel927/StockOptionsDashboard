@@ -1,13 +1,24 @@
 #!/usr/bin/env bash
 # Control script for the Stock Options Dashboard.
-# Usage: ./app.sh start | stop | restart | status | logs
+# Usage: ./app.sh <start|stop|restart|status|logs> [public|bots]
+#
+# Two apps live here: `public` (app.py, what gets deployed) and `bots`
+# (bots_app.py, local only). They get their own port, pidfile and log so both
+# can run at once — useful for checking that a change looks right in the app
+# that strangers see, not just the one with the bot tab.
 
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PORT="${PORT:-8555}"
-PIDFILE="$DIR/.app.pid"
-LOGFILE="$DIR/app.log"
+APP="${2:-public}"
+case "$APP" in
+  public) ENTRY="app.py";      DEFAULT_PORT=8555 ;;
+  bots)   ENTRY="bots_app.py"; DEFAULT_PORT=8556 ;;
+  *) echo "Unknown app '$APP' — expected 'public' or 'bots'." >&2; exit 1 ;;
+esac
+PORT="${PORT:-$DEFAULT_PORT}"
+PIDFILE="$DIR/.app-$APP.pid"
+LOGFILE="$DIR/app-$APP.log"
 STREAMLIT="$DIR/.venv/bin/streamlit"
 
 running() {
@@ -16,13 +27,13 @@ running() {
 
 start() {
   if running; then
-    echo "Already running (PID $(cat "$PIDFILE")) → http://localhost:$PORT"
+    echo "Already running $APP (PID $(cat "$PIDFILE")) → http://localhost:$PORT"
     return 0
   fi
   [[ -x "$STREAMLIT" ]] || { echo "streamlit not found at $STREAMLIT — is .venv set up?" >&2; exit 1; }
 
   cd "$DIR"
-  nohup "$STREAMLIT" run app.py \
+  nohup "$STREAMLIT" run "$ENTRY" \
     --server.headless true \
     --server.port "$PORT" \
     --browser.gatherUsageStats false \
@@ -31,7 +42,7 @@ start() {
 
   sleep 2
   if running; then
-    echo "Started (PID $(cat "$PIDFILE")) → http://localhost:$PORT"
+    echo "Started $APP ($ENTRY, PID $(cat "$PIDFILE")) → http://localhost:$PORT"
     echo "Logs: $LOGFILE"
   else
     echo "Failed to start. Last lines of $LOGFILE:" >&2
@@ -55,12 +66,12 @@ stop() {
   else
     rm -f "$PIDFILE"
     # Fall back to anything still holding the port.
-    STRAY="$(pgrep -f "streamlit run app.py.*--server.port $PORT" || true)"
+    STRAY="$(pgrep -f "streamlit run $ENTRY.*--server.port $PORT" || true)"
     if [[ -n "$STRAY" ]]; then
       echo "$STRAY" | xargs kill
       echo "Stopped stray process(es): $STRAY"
     else
-      echo "Not running"
+      echo "Not running ($APP)"
     fi
   fi
 }
@@ -71,14 +82,14 @@ case "${1:-}" in
   restart) stop; start ;;
   status)
     if running; then
-      echo "Running (PID $(cat "$PIDFILE")) → http://localhost:$PORT"
+      echo "Running $APP ($ENTRY, PID $(cat "$PIDFILE")) → http://localhost:$PORT"
     else
-      echo "Not running"
+      echo "Not running ($APP)"
     fi
     ;;
   logs)    tail -f "$LOGFILE" ;;
   *)
-    echo "Usage: $0 {start|stop|restart|status|logs}" >&2
+    echo "Usage: $0 {start|stop|restart|status|logs} [public|bots]" >&2
     exit 1
     ;;
 esac
