@@ -24,9 +24,8 @@ class ExtraTab:
     render: Callable[[Ctx], None]
 
 
-def run(store_factory: Callable[[], paper.Store], *, title: str, caption: str,
-        page_title: str, extra_tabs: Sequence[ExtraTab] = (),
-        banner: str | None = None) -> None:
+def run(store: paper.Store, *, title: str, caption: str, page_title: str,
+        extra_tabs: Sequence[ExtraTab] = (), banner: str | None = None) -> None:
     st.set_page_config(page_title=page_title, page_icon="📈", layout="wide")
     explorer.init_state()
     st.markdown(explorer.CSS, unsafe_allow_html=True)
@@ -35,11 +34,6 @@ def run(store_factory: Callable[[], paper.Store], *, title: str, caption: str,
     st.caption(caption)
     if banner:
         st.info(banner, icon=":material/info:")
-
-    # After the header, because resolving the store can halt the run while the
-    # browser reports what it has saved — and a page that halts before drawing
-    # anything is indistinguishable from one that crashed.
-    store = store_factory()
 
     with st.sidebar:
         st.header("Liquidity thresholds")

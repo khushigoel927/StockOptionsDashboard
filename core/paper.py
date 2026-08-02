@@ -25,7 +25,6 @@ import os
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from uuid import uuid4
 import threading
 
 SCHEMA_VERSION = 1
@@ -87,20 +86,6 @@ def describe(pos: dict) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def new_player() -> dict:
-    """A book's identity, for anything that compares books across people.
-
-    Random and self-assigned — it identifies a *book*, not a person, and there's
-    nothing to look up. It rides inside the book on purpose: export a book to
-    another device and your identity travels with it, which is what you'd want.
-    The flip side is that two people who import the same file share an id, and
-    any leaderboard has to be built expecting that.
-
-    `name` stays None until someone chooses to be listed somewhere.
-    """
-    return {"id": uuid4().hex[:12], "name": None}
-
-
 def new_book(starting_balance: float = DEFAULT_STARTING_BALANCE) -> dict:
     starting = _money(starting_balance)
     return {
@@ -110,7 +95,6 @@ def new_book(starting_balance: float = DEFAULT_STARTING_BALANCE) -> dict:
         "next_position_id": 1,
         "created_at": _now_iso(),
         "updated_at": _now_iso(),
-        "player": new_player(),
         "open": [],
         "history": [],
     }
@@ -372,21 +356,6 @@ def mark_pending(book: dict, position_id: int, error: str) -> tuple[bool, str]:
     return True, f"{describe(pos)} is waiting on a settlement price."
 
 
-def replace_book(book: dict, incoming: dict) -> tuple[bool, str]:
-    """Swap the live book's contents for an imported one.
-
-    Mutates in place so the Store keeps its reference to the same dict, exactly
-    like `reset_book`. Goes through `Store.mutate` so the import takes the lock
-    and is persisted like any other change.
-    """
-    if not isinstance(incoming, dict) or "cash" not in incoming:
-        return False, "That doesn't look like a playground book."
-    book.clear()
-    book.update(incoming)
-    return True, (f"Loaded a book with {len(book['open'])} open position(s), "
-                  f"{len(book['history'])} closed, and ${book['cash']:,.2f} cash.")
-
-
 def reset_book(book: dict, starting_balance: float) -> tuple[bool, str]:
     """Wipe everything and start over. Mutates in place so the Store keeps its
     reference to the same dict."""
@@ -417,54 +386,6 @@ def save_book(book: dict, path: Path) -> None:
     os.replace(tmp, path)  # atomic within one filesystem
 
 
-def dump_book(book: dict, *, compact: bool = False) -> str:
-    """The book as JSON text — for a download, or for browser storage.
-
-    `compact` drops the indentation, which is worth roughly a third of the bytes
-    when the destination is a storage quota rather than a file someone reads.
-    """
-    book["updated_at"] = _now_iso()
-    if compact:
-        return json.dumps(book, separators=(",", ":"))
-    return json.dumps(book, indent=2)
-
-
-def parse_book(text: str | bytes) -> tuple[dict, str | None]:
-    """Read a book from JSON text. Returns (book, warning) and never raises.
-
-    The counterpart to `dump_book`, and the only way a book should enter the app
-    from outside: it runs the same `_migrate`/`_coerce` path as a file on disk,
-    so an old export upgrades and a truncated one is rejected rather than
-    half-loaded.
-
-    Deliberately does NOT check the balance invariant — that's the caller's job
-    via `check_invariant`, because a book that doesn't add up should still be
-    *shown*, with a warning, rather than thrown away. It may be the only copy of
-    someone's trades.
-    """
-    if isinstance(text, bytes):
-        try:
-            text = text.decode("utf-8")
-        except UnicodeDecodeError:
-            return new_book(), "That file isn't UTF-8 text, so it isn't a playground book."
-    try:
-        raw = json.loads(text)
-    except (json.JSONDecodeError, TypeError) as exc:
-        return new_book(), f"That isn't valid JSON ({exc}), so nothing was loaded."
-    if not isinstance(raw, dict):
-        return new_book(), "That JSON isn't a playground book (expected an object)."
-    if "cash" not in raw and "open" not in raw and "history" not in raw:
-        # Valid JSON, but nothing book-shaped: better to say so than to hand
-        # back a pristine $200,000 book and let it look like a successful load.
-        return new_book(), "That JSON has no book in it (no cash, open or history)."
-
-    version = raw.get("schema_version", 0)
-    if isinstance(version, int) and version > SCHEMA_VERSION:
-        return _coerce(raw), (f"This book was written by a newer version of the app "
-                              f"(schema v{version}); some of it may not be understood.")
-    return _migrate(raw)
-
-
 def _coerce(raw: dict) -> dict:
     """Fill in anything a hand-edited file left out, without inventing money."""
     book = dict(raw)
@@ -475,14 +396,6 @@ def _coerce(raw: dict) -> dict:
     book["history"] = [h for h in book.get("history") or [] if isinstance(h, dict)]
     book.setdefault("created_at", _now_iso())
     book.setdefault("updated_at", _now_iso())
-    # Backfilled rather than migrated: books are already saved in people's
-    # browsers, and giving an old one an id on load is cheaper than a schema
-    # bump — it changes nothing about the money.
-    player = book.get("player")
-    if not isinstance(player, dict) or not player.get("id"):
-        book["player"] = new_player()
-    else:
-        player.setdefault("name", None)
 
     for pos in book["open"]:
         pos.setdefault("contracts", 1)
@@ -560,88 +473,7 @@ def load_book(path: Path) -> tuple[dict, str | None, bool]:
 
 
 # --------------------------------------------------------------------------- #
-# Backends — where a Store reads and writes its book
-# --------------------------------------------------------------------------- #
-
-
-class Backend:
-    """A place a book can be kept.
-
-    Exists so that `Store` doesn't know whether it's backed by a file, a
-    browser, a database, or nothing at all. Everything above it — the settlement
-    sweep, the renderers, the mutations — talks to a `Store` and never to
-    storage, so a new backend is additive rather than a change to the accounting.
-
-    `label` names the destination in error messages ("Could not save to ...").
-    """
-
-    label = "nowhere"
-
-    # True when the backend keeps a copy somewhere the user would reasonably
-    # want to be able to delete — their browser, say. Drives whether the UI
-    # offers to erase it, so that "where is my data" has an answer that isn't
-    # "nowhere you can reach".
-    erasable = False
-
-    # A persistence problem that isn't tied to any one mutation — a browser
-    # refusing to write, say. Kept apart from `Store.save_error` because that
-    # one is set and cleared per mutation, and a standing problem must not be
-    # cleared by the next trade happening to "succeed".
-    status_error: str | None = None
-
-    def load(self) -> tuple[dict, str | None, bool]:
-        """Return (book, warning to show the user, read_only)."""
-        raise NotImplementedError
-
-    def save(self, book: dict) -> None:
-        """Persist the book, or raise OSError. Called after every mutation."""
-        raise NotImplementedError
-
-    def erase(self) -> None:
-        """Delete the persisted copy. Only called when `erasable`."""
-        raise NotImplementedError
-
-
-class NullBackend(Backend):
-    """Keeps the book in memory and nothing else — the public deployment.
-
-    Loading always yields a fresh book, saving does nothing. Not a degraded
-    FileBackend: on a shared server there is no file that could belong to one
-    visitor, so "nowhere" is the correct destination rather than a missing one.
-    """
-
-    label = "memory"
-
-    def __init__(self, starting_balance: float = DEFAULT_STARTING_BALANCE) -> None:
-        self.starting_balance = starting_balance
-
-    def load(self) -> tuple[dict, str | None, bool]:
-        return new_book(self.starting_balance), None, False
-
-    def save(self, book: dict) -> None:
-        pass
-
-
-class FileBackend(Backend):
-    """A JSON file on local disk — the bots app.
-
-    Only correct where the process owns the file: one book, every tab and bot
-    sharing it. Useless on a host with an ephemeral or shared filesystem.
-    """
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.label = path.name
-
-    def load(self) -> tuple[dict, str | None, bool]:
-        return load_book(self.path)
-
-    def save(self, book: dict) -> None:
-        save_book(book, self.path)
-
-
-# --------------------------------------------------------------------------- #
-# Store
+# Process-global store
 # --------------------------------------------------------------------------- #
 
 
@@ -654,25 +486,30 @@ def book_path() -> Path:
 
 
 class Store:
-    """A book, the lock that guards it, and the backend it's persisted to.
+    """A book plus the lock and the file it's persisted to.
 
-    The backend decides the sharing model, and the two are not interchangeable:
+    `path=None` means memory only: nothing is read at startup and nothing is
+    ever written. That's what the public app uses, one Store per visitor, so
+    everyone gets their own balance and nobody's trades touch the disk.
 
-    * `NullBackend` — one Store per visitor, held in session state. Correct on a
-      shared server, where a process-global book would hand everyone the same
-      balance.
-    * `FileBackend` — one Store per process, shared by every tab and any bot.
-      Such a book must NOT live in st.session_state: that's per-session, so two
-      tabs would each hold a divergent copy and the last save would silently
-      discard the other's trades.
+    With a path, the book is loaded once and rewritten after every mutation, and
+    the Store is meant to be process-global — shared by every browser tab and by
+    any bot running in the same process. Such a book must NOT live in
+    st.session_state: that's per-session, so two tabs would each hold a
+    divergent copy and the last one to save would silently discard the other's
+    trades.
 
     Streamlit runs each session in its own thread, so every mutation takes a
     lock across read-modify-write-persist.
     """
 
-    def __init__(self, backend: Backend | None = None) -> None:
-        self.backend = backend or NullBackend()
-        self.book, self.load_warning, self.read_only = self.backend.load()
+    def __init__(self, path: Path | None = None, *,
+                 starting_balance: float = DEFAULT_STARTING_BALANCE) -> None:
+        self.path = path
+        if path is None:
+            self.book, self.load_warning, self.read_only = new_book(starting_balance), None, False
+        else:
+            self.book, self.load_warning, self.read_only = load_book(path)
         self.save_error: str | None = None
         self.last_sweep_at: float = 0.0
         self._lock = threading.Lock()
@@ -692,19 +529,16 @@ class Store:
                 return False, f"Could not complete that: {exc}"
             if not ok:
                 return ok, message
+            if self.path is None:  # memory-only book; nothing to persist
+                return ok, message
             try:
-                self.backend.save(self.book)
+                save_book(self.book, self.path)
                 self.save_error = None
             except OSError as exc:
                 # Keep the in-memory change so the session still works, but say so.
-                self.save_error = (f"Could not save to {self.backend.label}: {exc}. "
+                self.save_error = (f"Could not save to {self.path.name}: {exc}. "
                                    "Changes will be lost when the app restarts.")
             return ok, message
-
-    @property
-    def persistence_error(self) -> str | None:
-        """Anything stopping this book from being saved, whatever the cause."""
-        return self.save_error or self.backend.status_error
 
     def invariant_warning(self) -> str | None:
         return check_invariant(self.book)

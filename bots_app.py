@@ -37,14 +37,14 @@ def render_bots(ctx: Ctx) -> None:
             "Sell buttons use.", icon=":material/robot_2:")
 
     book = ctx.store.book
-    st.caption(f"Book: `{ctx.store.backend.label}` · {len(book['open'])} open · "
+    st.caption(f"Book: `{ctx.store.path}` · {len(book['open'])} open · "
                f"{len(book['history'])} closed · available "
                f"\\${paper.available_cash(book):,.2f}")
 
 
 def main() -> None:
     shell.run(
-        stores.shared_store,
+        stores.shared_store(),
         page_title="Options Selling Explorer (local)",
         title="📈 Options Selling Explorer · local",
         caption=CAPTION,
