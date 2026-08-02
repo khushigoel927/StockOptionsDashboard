@@ -28,7 +28,7 @@ def session_store(starting_balance: float = paper.DEFAULT_STARTING_BALANCE) -> p
     """
     store = st.session_state.get(SESSION_KEY)
     if store is None:
-        store = paper.Store(path=None, starting_balance=starting_balance)
+        store = paper.Store(paper.NullBackend(starting_balance))
         st.session_state[SESSION_KEY] = store
     return store
 
@@ -44,4 +44,4 @@ def shared_store() -> paper.Store:
     Only safe because that deployment has exactly one user. Never wire this into
     `app.py`.
     """
-    return paper.Store(paper.book_path())
+    return paper.Store(paper.FileBackend(paper.book_path()))

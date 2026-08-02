@@ -245,6 +245,9 @@ requirements.txt  streamlit, yfinance, pandas, tzdata
 howToRun.txt      the app.sh cheat sheet
 ```
 
+- **`core/paper.py` backends** — `Store` reads and writes through a `Backend` rather than a
+  path, so where a book lives is a swap rather than a change to the accounting. `NullBackend`
+  keeps it in memory (public), `FileBackend` on disk (local).
 - **`core/stores.py`** — the load-bearing file. `session_store()` is deliberately *not*
   `@st.cache_resource` (process-global would hand every visitor the same balance);
   `shared_store()` deliberately *is*, because bots and browser tabs in the local app have to mutate

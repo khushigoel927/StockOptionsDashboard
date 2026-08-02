@@ -473,7 +473,72 @@ def load_book(path: Path) -> tuple[dict, str | None, bool]:
 
 
 # --------------------------------------------------------------------------- #
-# Process-global store
+# Backends — where a Store reads and writes its book
+# --------------------------------------------------------------------------- #
+
+
+class Backend:
+    """A place a book can be kept.
+
+    Exists so that `Store` doesn't know whether it's backed by a file, a
+    browser, a database, or nothing at all. Everything above it — the settlement
+    sweep, the renderers, the mutations — talks to a `Store` and never to
+    storage, so a new backend is additive rather than a change to the accounting.
+
+    `label` names the destination in error messages ("Could not save to ...").
+    """
+
+    label = "nowhere"
+
+    def load(self) -> tuple[dict, str | None, bool]:
+        """Return (book, warning to show the user, read_only)."""
+        raise NotImplementedError
+
+    def save(self, book: dict) -> None:
+        """Persist the book, or raise OSError. Called after every mutation."""
+        raise NotImplementedError
+
+
+class NullBackend(Backend):
+    """Keeps the book in memory and nothing else — the public deployment.
+
+    Loading always yields a fresh book, saving does nothing. Not a degraded
+    FileBackend: on a shared server there is no file that could belong to one
+    visitor, so "nowhere" is the correct destination rather than a missing one.
+    """
+
+    label = "memory"
+
+    def __init__(self, starting_balance: float = DEFAULT_STARTING_BALANCE) -> None:
+        self.starting_balance = starting_balance
+
+    def load(self) -> tuple[dict, str | None, bool]:
+        return new_book(self.starting_balance), None, False
+
+    def save(self, book: dict) -> None:
+        pass
+
+
+class FileBackend(Backend):
+    """A JSON file on local disk — the bots app.
+
+    Only correct where the process owns the file: one book, every tab and bot
+    sharing it. Useless on a host with an ephemeral or shared filesystem.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.label = path.name
+
+    def load(self) -> tuple[dict, str | None, bool]:
+        return load_book(self.path)
+
+    def save(self, book: dict) -> None:
+        save_book(book, self.path)
+
+
+# --------------------------------------------------------------------------- #
+# Store
 # --------------------------------------------------------------------------- #
 
 
@@ -486,30 +551,25 @@ def book_path() -> Path:
 
 
 class Store:
-    """A book plus the lock and the file it's persisted to.
+    """A book, the lock that guards it, and the backend it's persisted to.
 
-    `path=None` means memory only: nothing is read at startup and nothing is
-    ever written. That's what the public app uses, one Store per visitor, so
-    everyone gets their own balance and nobody's trades touch the disk.
+    The backend decides the sharing model, and the two are not interchangeable:
 
-    With a path, the book is loaded once and rewritten after every mutation, and
-    the Store is meant to be process-global — shared by every browser tab and by
-    any bot running in the same process. Such a book must NOT live in
-    st.session_state: that's per-session, so two tabs would each hold a
-    divergent copy and the last one to save would silently discard the other's
-    trades.
+    * `NullBackend` — one Store per visitor, held in session state. Correct on a
+      shared server, where a process-global book would hand everyone the same
+      balance.
+    * `FileBackend` — one Store per process, shared by every tab and any bot.
+      Such a book must NOT live in st.session_state: that's per-session, so two
+      tabs would each hold a divergent copy and the last save would silently
+      discard the other's trades.
 
     Streamlit runs each session in its own thread, so every mutation takes a
     lock across read-modify-write-persist.
     """
 
-    def __init__(self, path: Path | None = None, *,
-                 starting_balance: float = DEFAULT_STARTING_BALANCE) -> None:
-        self.path = path
-        if path is None:
-            self.book, self.load_warning, self.read_only = new_book(starting_balance), None, False
-        else:
-            self.book, self.load_warning, self.read_only = load_book(path)
+    def __init__(self, backend: Backend | None = None) -> None:
+        self.backend = backend or NullBackend()
+        self.book, self.load_warning, self.read_only = self.backend.load()
         self.save_error: str | None = None
         self.last_sweep_at: float = 0.0
         self._lock = threading.Lock()
@@ -529,14 +589,12 @@ class Store:
                 return False, f"Could not complete that: {exc}"
             if not ok:
                 return ok, message
-            if self.path is None:  # memory-only book; nothing to persist
-                return ok, message
             try:
-                save_book(self.book, self.path)
+                self.backend.save(self.book)
                 self.save_error = None
             except OSError as exc:
                 # Keep the in-memory change so the session still works, but say so.
-                self.save_error = (f"Could not save to {self.path.name}: {exc}. "
+                self.save_error = (f"Could not save to {self.backend.label}: {exc}. "
                                    "Changes will be lost when the app restarts.")
             return ok, message
 
