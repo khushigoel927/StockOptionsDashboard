@@ -44,7 +44,7 @@ def render_bots(ctx: Ctx) -> None:
 
 def main() -> None:
     shell.run(
-        stores.shared_store(),
+        stores.shared_store,
         page_title="Options Selling Explorer (local)",
         title="📈 Options Selling Explorer · local",
         caption=CAPTION,

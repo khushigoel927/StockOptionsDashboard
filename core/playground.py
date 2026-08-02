@@ -367,6 +367,19 @@ def transfer_dialog(store: paper.Store) -> None:
     if upload is not None:
         _import_book(store, upload)
 
+    if store.backend.erasable:
+        st.divider()
+        st.caption(f"Your book is saved in **{store.backend.label}** and never reaches "
+                   "our server. Erasing deletes that copy and starts you over — "
+                   "download it first if you might want it back.")
+        if st.button("Erase and start over", icon=":material/delete_forever:",
+                     disabled=store.read_only):
+            store.backend.erase()
+            store.mutate(paper.reset_book, float(book["starting_balance"]))
+            st.toast("Erased. You're back to a fresh playground.",
+                     icon=":material/delete_forever:")
+            st.rerun()
+
 
 @st.dialog("Reset playground", icon=":material/restart_alt:")
 def reset_dialog(store: paper.Store) -> None:
@@ -624,8 +637,8 @@ def _live_section(store: paper.Store, min_oi: int, min_volume: int) -> None:
     Kept sequential (not `parallel=True`) because that mode forbids st.dialog,
     which the buy-to-close and abandon flows need.
     """
-    if store.save_error:
-        st.error(md(store.save_error), icon=":material/save:")
+    if store.persistence_error:
+        st.error(md(store.persistence_error), icon=":material/save:")
 
     drift = store.invariant_warning()
     if drift:
@@ -634,7 +647,15 @@ def _live_section(store: paper.Store, min_oi: int, min_volume: int) -> None:
                    icon=":material/calculate:")
 
     forced = bool(st.session_state.pop("pg_force_sweep", False))
-    for message in settle_due_positions(store, force=forced):
+    settled = settle_due_positions(store, force=forced)
+    if settled:
+        # A settlement inside this fragment changes the book without the rest of
+        # the app running, and it's the full run that mirrors the book into
+        # browser storage. Escalate to an app-wide rerun so the change is
+        # persisted now rather than whenever something else happens to rerun.
+        st.session_state["pg_settled_messages"] = settled
+        st.rerun()
+    for message in st.session_state.pop("pg_settled_messages", []):
         st.toast(md(message), icon=":material/gavel:")
 
     spots = market.spots_for(p["symbol"] for p in store.book["open"])

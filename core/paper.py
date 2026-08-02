@@ -553,12 +553,28 @@ class Backend:
 
     label = "nowhere"
 
+    # True when the backend keeps a copy somewhere the user would reasonably
+    # want to be able to delete — their browser, say. Drives whether the UI
+    # offers to erase it, so that "where is my data" has an answer that isn't
+    # "nowhere you can reach".
+    erasable = False
+
+    # A persistence problem that isn't tied to any one mutation — a browser
+    # refusing to write, say. Kept apart from `Store.save_error` because that
+    # one is set and cleared per mutation, and a standing problem must not be
+    # cleared by the next trade happening to "succeed".
+    status_error: str | None = None
+
     def load(self) -> tuple[dict, str | None, bool]:
         """Return (book, warning to show the user, read_only)."""
         raise NotImplementedError
 
     def save(self, book: dict) -> None:
         """Persist the book, or raise OSError. Called after every mutation."""
+        raise NotImplementedError
+
+    def erase(self) -> None:
+        """Delete the persisted copy. Only called when `erasable`."""
         raise NotImplementedError
 
 
@@ -660,6 +676,11 @@ class Store:
                 self.save_error = (f"Could not save to {self.backend.label}: {exc}. "
                                    "Changes will be lost when the app restarts.")
             return ok, message
+
+    @property
+    def persistence_error(self) -> str | None:
+        """Anything stopping this book from being saved, whatever the cause."""
+        return self.save_error or self.backend.status_error
 
     def invariant_warning(self) -> str | None:
         return check_invariant(self.book)

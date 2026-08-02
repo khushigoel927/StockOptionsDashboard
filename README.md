@@ -18,13 +18,14 @@ The same UI ships in two configurations, differing only in where the book lives:
 
 | | entrypoint | the book | who it's for |
 |---|---|---|---|
-| **Public** | `app.py` | in memory, **one per visitor**, never written to disk | deployed to Streamlit Community Cloud |
+| **Public** | `app.py` | **one per visitor**, saved in that visitor's own browser | deployed to Streamlit Community Cloud |
 | **Local** | `bots_app.py` | one on disk (`paper_book.json`), shared by every tab | you, on localhost, plus an extra **Bots** tab |
 
 The split exists because the playground keeps score. A single process-global book is right when one
 person runs the server and wrong the moment strangers share it — everyone would spend the same
-balance and settle each other's positions. So the public app scopes the book to
-`st.session_state`: your positions are yours, and they last as long as your browser session.
+balance and settle each other's positions. So the public app scopes the book to `st.session_state`
+and mirrors it into the visitor's own `localStorage` — your positions are yours, they survive
+closing the tab, and they never reach the server.
 
 `app.py` imports `core/` and nothing else, so the bot layer is absent from the deployment even
 though it lives in the same repository. The arrow is one-way: `bots/` may import `core/`, `core/`
@@ -158,9 +159,20 @@ reserve, and retries — it is never settled at a guess. A position whose ticker
 
 Depends on which app you're running — see [Two apps, one codebase](#two-apps-one-codebase).
 
-**Public (`app.py`)** — nowhere. `paper.Store(path=None)` holds the book in memory and writes
-nothing, so there's no file to leak one visitor's trades to another and no state to clean up. The
-book dies with the browser session or the next app restart, which the banner says up front.
+**Public (`app.py`)** — in the visitor's browser, under the `localStorage` key
+`options-playground/book/v1`. Nothing reaches the server, so there's no file that could leak one
+visitor's trades to another, no database to run, and no data of anyone's to be responsible for. A
+book survives closing the tab and every app restart; it does not follow you to another browser or
+device, which is what **Save or load** is for.
+
+That has a consequence worth stating plainly: the book is data the user controls, so anyone willing
+to open dev tools can give themselves $10M. Fine for a playground, and the reason
+`check_invariant` runs on every load — a book that doesn't add up is *shown with a warning* rather
+than trusted or thrown away.
+
+Storage can fail through no fault of the user (Safari private browsing throws on write, so does a
+full quota). Those failures surface as a visible error with a nudge to download a copy, rather than
+being swallowed into a book that silently stops saving.
 
 **Local (`bots_app.py`)** — `paper_book.json` in the project root (override with `PAPER_BOOK_PATH`).
 Gitignored: it's your state, not code. Writes are atomic, so a crash can't truncate it, and an
@@ -239,6 +251,7 @@ core/             everything both apps share
   explorer.py     explorer UI, the cards, and the Sell buttons
   shell.py        the page both apps draw: title, sidebar, toolbar, tabs
   stores.py       where the book lives — the one thing the two apps disagree on
+  browser.py      the localStorage sync component (public app's persistence)
 bots/             local-only bot layer (empty; see its docstring for the seam)
 app.sh            start/stop/restart/status/logs wrapper around Streamlit
 requirements.txt  streamlit, yfinance, pandas, tzdata
@@ -248,6 +261,12 @@ howToRun.txt      the app.sh cheat sheet
 - **`core/paper.py` backends** — `Store` reads and writes through a `Backend` rather than a
   path, so where a book lives is a swap rather than a change to the accounting. `NullBackend`
   keeps it in memory (public), `FileBackend` on disk (local).
+- **`core/browser.py`** — a JS-only CCv2 component that mirrors the book into `localStorage`. The
+  handshake is two-phase: on the first render Python has nothing, so the component reports what's
+  stored and triggers one more rerun; from then on Python is authoritative and the component writes
+  when the book changes. The first render is gated behind a "restoring" message because without it
+  a returning visitor would see a fresh $200,000 book flash before their real one loaded, which
+  looks exactly like data loss.
 - **`core/stores.py`** — the load-bearing file. `session_store()` is deliberately *not*
   `@st.cache_resource` (process-global would hand every visitor the same balance);
   `shared_store()` deliberately *is*, because bots and browser tabs in the local app have to mutate
