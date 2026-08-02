@@ -25,6 +25,7 @@ import os
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from uuid import uuid4
 import threading
 
 SCHEMA_VERSION = 1
@@ -86,6 +87,20 @@ def describe(pos: dict) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def new_player() -> dict:
+    """A book's identity, for anything that compares books across people.
+
+    Random and self-assigned — it identifies a *book*, not a person, and there's
+    nothing to look up. It rides inside the book on purpose: export a book to
+    another device and your identity travels with it, which is what you'd want.
+    The flip side is that two people who import the same file share an id, and
+    any leaderboard has to be built expecting that.
+
+    `name` stays None until someone chooses to be listed somewhere.
+    """
+    return {"id": uuid4().hex[:12], "name": None}
+
+
 def new_book(starting_balance: float = DEFAULT_STARTING_BALANCE) -> dict:
     starting = _money(starting_balance)
     return {
@@ -95,6 +110,7 @@ def new_book(starting_balance: float = DEFAULT_STARTING_BALANCE) -> dict:
         "next_position_id": 1,
         "created_at": _now_iso(),
         "updated_at": _now_iso(),
+        "player": new_player(),
         "open": [],
         "history": [],
     }
@@ -459,6 +475,14 @@ def _coerce(raw: dict) -> dict:
     book["history"] = [h for h in book.get("history") or [] if isinstance(h, dict)]
     book.setdefault("created_at", _now_iso())
     book.setdefault("updated_at", _now_iso())
+    # Backfilled rather than migrated: books are already saved in people's
+    # browsers, and giving an old one an id on load is cheaper than a schema
+    # bump — it changes nothing about the money.
+    player = book.get("player")
+    if not isinstance(player, dict) or not player.get("id"):
+        book["player"] = new_player()
+    else:
+        player.setdefault("name", None)
 
     for pos in book["open"]:
         pos.setdefault("contracts", 1)

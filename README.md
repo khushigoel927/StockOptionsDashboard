@@ -252,6 +252,7 @@ core/             everything both apps share
   shell.py        the page both apps draw: title, sidebar, toolbar, tabs
   stores.py       where the book lives — the one thing the two apps disagree on
   browser.py      the localStorage sync component (public app's persistence)
+  scores.py       scorecards and book auditing — groundwork for a leaderboard
 bots/             local-only bot layer (empty; see its docstring for the seam)
 app.sh            start/stop/restart/status/logs wrapper around Streamlit
 requirements.txt  streamlit, yfinance, pandas, tzdata
@@ -294,6 +295,43 @@ and `usd()` helpers in `core/playground.py`. Streamlit reads a pair of unescaped
 inline LaTeX, which silently turns a caption full of dollar amounts into an equation. The explorer's
 cards are exempt because their numbers sit inside `<div>` blocks, which CommonMark passes through
 without parsing inline markdown.
+
+## A leaderboard, if you want one
+
+`core/scores.py` has the groundwork: `scorecard()` builds the row, `audit()` says whether to
+believe it, and `Leaderboard` is the socket a backend plugs into. `NullLeaderboard` is what's
+installed, so callers can check `.configured` and hide the UI rather than offering a board that
+silently drops submissions.
+
+**What a server can verify.** Settlement is deterministic — an option expiring on a date settles at
+the underlying's real close, which `fetch_settlement_close` can re-fetch for any past date. So
+every settled trade's P&L can be recomputed from scratch. The balance identity is checkable too.
+Together those catch a book with free cash in it, a faked settlement cost, a trade settled before
+it expired, and a premium that doesn't match its own per-share price:
+
+```
+! Balance doesn't add up. Balance drift of $99,700.00: cash is $298,800.00 but starting $200,000.00…
+! MSFT Jan 16, 2026 400 call settled against $457.82, which costs $5,782.12 — the book recorded $0.00.
+! AAPL Dec 17, 2027 200 put is recorded as settled but hasn't expired yet.
+```
+
+The settlement check is the one with teeth: the second line above passes the balance invariant
+cleanly, because the book was edited consistently. Only re-deriving the close catches it.
+
+**What no server can verify.** The premium someone claims to have collected. yfinance serves live
+option quotes and historical *stock* closes — there is no historical option quote to check a claimed
+fill against. A book asserting it sold a far-OTM put for $50 a share is arithmetically consistent
+and unfalsifiable.
+
+That limit has nothing to do with storing books in the browser, and accounts and a database would
+not fix it. The only real fix is routing trades through the server as they happen, so the server
+records the price instead of being told it. So: a fun board, not a contest.
+
+**What's still needed to turn it on.** A `Leaderboard` implementation backed by an external
+database (Community Cloud's disk is wiped on restart), reached via `st.connection` with credentials
+in the app's secrets. Submission must stay explicit and opt-in — a book is private by construction
+today, and quietly shipping it to a server the first time someone sells a put would undo the reason
+it lives in the browser at all.
 
 ## Caveats
 
