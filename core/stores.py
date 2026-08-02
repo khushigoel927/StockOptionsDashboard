@@ -74,8 +74,14 @@ def session_store() -> paper.Store:
     """
     store = st.session_state.get(SESSION_KEY)
 
+    # Exactly one mount per run, whichever phase we're in. Deciding what to
+    # write *before* mounting is what keeps that true: mounting to read and then
+    # again to write would be two elements sharing one key, which Streamlit
+    # rejects — and the run where hydration finishes is the run that does both.
+    write = paper.dump_book(store.book, compact=True) if store is not None else None
+    reply = browser.sync(write=write)
+
     if store is None:
-        reply = browser.sync(write=None)
         if not reply.answered:
             # One extra rerun, by construction — the component can't answer
             # until it has mounted. Gate rather than render a fresh book that
@@ -83,12 +89,12 @@ def session_store() -> paper.Store:
             st.info("Restoring your playground from this browser…",
                     icon=":material/hourglass_top:")
             st.stop()
+        # Nothing to mirror on this run: the book either came out of storage
+        # already or is empty. The first change to it triggers a rerun, and that
+        # run writes.
         store = _restore(reply.stored)
         st.session_state[SESSION_KEY] = store
 
-    # Steady state: mirror the current book back. Cheap when nothing changed —
-    # the component compares before writing.
-    reply = browser.sync(write=paper.dump_book(store.book, compact=True))
     store.backend.status_error = (
         f"This browser wouldn't save your playground ({reply.error}). Private "
         "browsing and a full storage quota both do this. You can keep trading, "
