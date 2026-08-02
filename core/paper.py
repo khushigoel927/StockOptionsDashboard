@@ -356,6 +356,21 @@ def mark_pending(book: dict, position_id: int, error: str) -> tuple[bool, str]:
     return True, f"{describe(pos)} is waiting on a settlement price."
 
 
+def replace_book(book: dict, incoming: dict) -> tuple[bool, str]:
+    """Swap the live book's contents for an imported one.
+
+    Mutates in place so the Store keeps its reference to the same dict, exactly
+    like `reset_book`. Goes through `Store.mutate` so the import takes the lock
+    and is persisted like any other change.
+    """
+    if not isinstance(incoming, dict) or "cash" not in incoming:
+        return False, "That doesn't look like a playground book."
+    book.clear()
+    book.update(incoming)
+    return True, (f"Loaded a book with {len(book['open'])} open position(s), "
+                  f"{len(book['history'])} closed, and ${book['cash']:,.2f} cash.")
+
+
 def reset_book(book: dict, starting_balance: float) -> tuple[bool, str]:
     """Wipe everything and start over. Mutates in place so the Store keeps its
     reference to the same dict."""
@@ -384,6 +399,54 @@ def save_book(book: dict, path: Path) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)  # atomic within one filesystem
+
+
+def dump_book(book: dict, *, compact: bool = False) -> str:
+    """The book as JSON text — for a download, or for browser storage.
+
+    `compact` drops the indentation, which is worth roughly a third of the bytes
+    when the destination is a storage quota rather than a file someone reads.
+    """
+    book["updated_at"] = _now_iso()
+    if compact:
+        return json.dumps(book, separators=(",", ":"))
+    return json.dumps(book, indent=2)
+
+
+def parse_book(text: str | bytes) -> tuple[dict, str | None]:
+    """Read a book from JSON text. Returns (book, warning) and never raises.
+
+    The counterpart to `dump_book`, and the only way a book should enter the app
+    from outside: it runs the same `_migrate`/`_coerce` path as a file on disk,
+    so an old export upgrades and a truncated one is rejected rather than
+    half-loaded.
+
+    Deliberately does NOT check the balance invariant — that's the caller's job
+    via `check_invariant`, because a book that doesn't add up should still be
+    *shown*, with a warning, rather than thrown away. It may be the only copy of
+    someone's trades.
+    """
+    if isinstance(text, bytes):
+        try:
+            text = text.decode("utf-8")
+        except UnicodeDecodeError:
+            return new_book(), "That file isn't UTF-8 text, so it isn't a playground book."
+    try:
+        raw = json.loads(text)
+    except (json.JSONDecodeError, TypeError) as exc:
+        return new_book(), f"That isn't valid JSON ({exc}), so nothing was loaded."
+    if not isinstance(raw, dict):
+        return new_book(), "That JSON isn't a playground book (expected an object)."
+    if "cash" not in raw and "open" not in raw and "history" not in raw:
+        # Valid JSON, but nothing book-shaped: better to say so than to hand
+        # back a pristine $200,000 book and let it look like a successful load.
+        return new_book(), "That JSON has no book in it (no cash, open or history)."
+
+    version = raw.get("schema_version", 0)
+    if isinstance(version, int) and version > SCHEMA_VERSION:
+        return _coerce(raw), (f"This book was written by a newer version of the app "
+                              f"(schema v{version}); some of it may not be understood.")
+    return _migrate(raw)
 
 
 def _coerce(raw: dict) -> dict:

@@ -304,6 +304,70 @@ def abandon_dialog(store: paper.Store, position_id: int) -> None:
             st.rerun()
 
 
+def _import_book(store: paper.Store, upload) -> None:
+    """Load an uploaded book, replacing whatever is in the playground now.
+
+    Runs at most once per uploaded file: `st.file_uploader` keeps returning the
+    same file on every rerun, so without the id check a single upload would
+    re-import on every timer tick and stamp out any trade made since.
+    """
+    if st.session_state.get("pg_imported_file") == upload.file_id:
+        return
+    st.session_state["pg_imported_file"] = upload.file_id
+
+    incoming, warning = paper.parse_book(upload.getvalue())
+    if warning and not incoming.get("open") and not incoming.get("history"):
+        st.error(md(warning), icon=":material/error:")
+        return
+
+    ok, message = store.mutate(paper.replace_book, incoming)
+    if not ok:
+        st.error(md(message), icon=":material/error:")
+        return
+
+    # Report a book that doesn't add up rather than silently trusting it — an
+    # imported file is the one book the app didn't write itself.
+    drift = store.invariant_warning()
+    for text in filter(None, [warning, drift]):
+        st.warning(md(text), icon=":material/warning:")
+    st.toast(md(message), icon=":material/upload:")
+    st.rerun()
+
+
+@st.dialog("Save or load your book", icon=":material/save:")
+def transfer_dialog(store: paper.Store) -> None:
+    book = store.book
+    st.caption("Your playground is a single JSON file. Download it to keep a copy or "
+               "move it to another browser, and upload it here to pick up where you "
+               "left off.")
+
+    stamp = date.today().isoformat()
+    st.download_button(
+        "Download my book",
+        data=paper.dump_book(book),
+        file_name=f"paper-book-{stamp}.json",
+        mime="application/json",
+        icon=":material/download:",
+        type="primary",
+        width="stretch",
+        help="A snapshot of your balance, open positions and history.",
+    )
+    st.caption(f"{len(book['open'])} open · {len(book['history'])} closed · "
+               f"{usd(book['cash'])} cash")
+
+    st.divider()
+
+    upload = st.file_uploader("Load a book", type=["json"],
+                              help="Replaces everything currently in your playground.")
+    if book["open"] or book["history"]:
+        st.caption(":orange[Loading a book replaces the "
+                   f"{len(book['open'])} open position(s) and "
+                   f"{len(book['history'])} history record(s) you have now. "
+                   "Download a copy first if you want to keep them.]")
+    if upload is not None:
+        _import_book(store, upload)
+
+
 @st.dialog("Reset playground", icon=":material/restart_alt:")
 def reset_dialog(store: paper.Store) -> None:
     book = store.book
@@ -591,9 +655,12 @@ def render_playground(store: paper.Store, min_oi: int, min_volume: int) -> None:
     elif store.load_warning:
         st.warning(md(store.load_warning), icon=":material/warning:")
 
-    # Outside the fragment: resetting is a deliberate act, not something that
-    # needs re-rendering on a timer.
+    # Outside the fragment: these are deliberate acts, not something that needs
+    # re-rendering on a timer.
     with st.container(horizontal=True, horizontal_alignment="right"):
+        if st.button("Save or load", icon=":material/save:",
+                     help="Download your book as a file, or load one back in."):
+            transfer_dialog(store)
         if st.button("Reset playground", icon=":material/restart_alt:",
                      disabled=store.read_only,
                      help="Clear every position and start again from a fresh balance."):
